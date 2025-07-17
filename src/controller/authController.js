@@ -2,8 +2,11 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const Users = require('../model/Users');
 const secret = process.env.JWT_SECRET;
+const refreshSecret = process.env.JWT_REFRESH_TOKEN_SECRET;
 const { OAuth2Client } = require('google-auth-library');
 const { validationResult } = require('express-validator');
+const sendResetToken = require('../service/forgetPassword');
+const ResetCodes = require('../model/ResetCodes');
 
 const authController = {
     login: async (request, response) => {
@@ -36,7 +39,8 @@ const authController = {
                 credits: data.credits,
                 subscription: data.subscription
             };
-            const token = jwt.sign(userDetails, secret, { expiresIn: '1h' });
+            const token = jwt.sign(userDetails, secret, { expiresIn: '1m' });
+            const refreshToken = jwt.sign(userDetails,refreshSecret,{expiresIn:'7d'});
 
             response.cookie('jwtToken', token, {
                 httpOnly: true,
@@ -44,6 +48,14 @@ const authController = {
                 domain: 'localhost',
                 path: '/'
             });
+
+            response.cookie('refreshToken', refreshToken, {
+                httpOnly: true,
+                secure: true,
+                domain: 'localhost',
+                path: '/'
+            });
+
             response.json({ message: 'User authenticated', userDetails: userDetails });
         } catch (error) {
             console.log(error);
@@ -53,6 +65,7 @@ const authController = {
 
     logout: (request, response) => {
         response.clearCookie('jwtToken');
+        response.clearCookie('refreshToken');
         response.json({ message: 'User logged out successfully' });
     },
 
@@ -152,8 +165,15 @@ const authController = {
             };
 
             const token = jwt.sign(user, secret, { expiresIn: '1h' });
+            const refreshToken = jwt.sign(user, refreshSecret, { expiresIn: '7d' });
 
             response.cookie('jwtToken', token, {
+                httpOnly: true,
+                secure: true,
+                domain: 'localhost',
+                path: '/'
+            });
+            response.cookie('refreshToken', refreshToken, {
                 httpOnly: true,
                 secure: true,
                 domain: 'localhost',
@@ -165,6 +185,100 @@ const authController = {
             return response.status(500).json({ error: 'Internal server error' });
         }
     },
+
+    refreshToken: async(request, response) => {
+        try{
+            const refreshToken = request.cookies?.refreshToken;
+            if(!refreshToken){
+                return response.status(401).json({message:'No refresh token'});
+            }
+            const decoded = jwt.verify(refreshToken,refreshSecret);
+            const data = await Users.findById({_id:decoded.id});
+            const user = {
+                id:data._id,
+                uername:data.email,
+                name:data.name,
+                role:data.role? data.role:'admin',
+                credits: data.credits,
+                subscription: data.subscription
+            };
+            
+            
+
+            const newAccessToken = jwt.sign(user,secret,{expiresIn:'1h'});
+            response.cookie('jwtToken', newAccessToken, {
+                httpOnly: true,
+                secure: true,
+                domain: 'localhost',
+                path: '/'
+            });
+            response.json({message:'Token refreshed', userDetails:user});
+        }catch(error){
+            console.log(error);
+            response.status(500).json({message:'Internal server error'});
+        }
+    },
+
+    sendResetPasswordToken : async (request, response) => {
+        const {email} = request.body;
+        try{
+            const data = await Users.findOne({email:email});
+            if(!data) {
+                return response.json({message: 'Data not found'});
+            }
+            const mailData = await sendResetToken.sendResetToken(email);
+            const existingCode = await ResetCodes.findOne({userId:data._id});
+
+            let date = new Date();
+            date.setMinutes(date.getMinutes() + 5);
+
+            if(!existingCode){
+                const newResetCodes = new ResetCodes({
+                    userId:data._id,
+                    code: mailData,
+                    duration: date,
+                }); 
+                await newResetCodes.save();
+            }
+            else{
+                existingCode.code = mailData;
+                existingCode.duration= date;
+                await existingCode.save();
+            }
+
+            response.status(200).json({message: 'Email sent'});
+
+        }catch(error){
+            console.log(error);
+            response.status(500).json({message: 'Internal server error'});
+        }
+    },
+
+    resetPassword : async (request, response) => {
+        const {code , email, newPassword} = request.body;
+        try{
+            const userData = await Users.findOne({email:email});
+            if(!userData){
+                return response.json({message:'Data not found'});
+            }
+
+            const resetCodes = await ResetCodes.findOne({userId:userData._id});
+            const modifiedPassword = await bcrypt.hash(newPassword,10)
+
+            if(resetCodes.code === code && resetCodes.duration > new Date()){
+                userData.password = await bcrypt.hash(newPassword,10);
+                await userData.save();
+                console.log(userData.password);
+                response.status(200).json({message:'Password reset successfull'});
+            }
+            else{
+                return response.json({message:'otp expired Try again'});
+            }
+        } catch(error){
+            console.log(error);
+            response.status(500).json({message: 'Internal server error'});
+        }
+    }
 };
 
 module.exports = authController;
